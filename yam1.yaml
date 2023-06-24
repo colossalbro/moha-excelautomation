@@ -1,0 +1,808 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  DynamoDBTableName:
+    Type: String
+    Description: Name of the DynamoDB table
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket
+  PrimaryKeyID:
+    Type: String
+    Description: Primary key for dynamodb
+    Default: Lab Name
+  SortKeyID: 
+    Type: String
+    Description: second ID unique for dynamodb
+    Default: Sample Number (ID)
+Resources:
+  MyApiGatewayRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: MyApiGatewayRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GeneratePresignedPost'
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+  ProcessLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: ProcessLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: process-LambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:Scan' 
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LabDynamoDBTable}
+
+  ProcessFileFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: lab-processlambda
+      Runtime: python3.9
+      MemorySize: 1000
+      Timeout: 900
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessLambdaRole.Arn
+      Layers:
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:7"
+      Environment:
+        Variables:
+          tableName: !Ref DynamoDBTableName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import pandas as pd
+          from decimal import Decimal
+          from botocore.exceptions import ClientError
+          import datetime
+
+          def lambda_handler(event, context):
+              # Retrieve the S3 object from the event
+              s3 = boto3.client('s3')
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+
+              # Download the Excel file from S3
+              response = s3.get_object(Bucket=bucket, Key=key)
+              file_content = response['Body'].read()
+
+              # Load the Excel file using pandas
+              xls = pd.ExcelFile(file_content)
+              sheet_names = xls.sheet_names
+
+              # Create an empty list to store individual DataFrames for each sheet
+              dfs = []
+
+              # Iterate over each sheet in the Excel file
+              for sheet_name in sheet_names:
+                  if sheet_name == 'Drop Down Data':  # Replace 'Drop Down Data' with the actual sheet name to skip
+                      continue
+
+                  df = xls.parse(sheet_name)
+                  # Check if Lab Name, State, and Sample Number (ID) columns are empty
+                  if df['Lab Name'].empty or df['State'].empty or df['Sample Number (ID)'].empty:
+                      continue
+                  # Exclude rows where Lab Name, State, or Sample Number (ID) values are empty
+                  df = df[(~df['Lab Name'].isna()) & (~df['State'].isna()) & (~df['Sample Number (ID)'].isna())]
+
+                  # Add the "updated date" column with the current time
+                  df['Updated Date'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S GMT+1")
+
+                  dfs.append(df)
+
+              # Combine all DataFrames into a single DataFrame
+              combined_df = pd.concat(dfs, ignore_index=True)
+
+              # Process the Excel data
+              dynamodb = boto3.resource('dynamodb')
+              table_name = os.environ.get('tableName')
+
+              table = dynamodb.Table(table_name)
+
+              try:
+                  with table.batch_writer() as batch:
+                      for _, row in combined_df.iterrows():
+                          item = {}
+
+                          for column in combined_df.columns:
+                              value = row[column]
+
+                              # Convert NaN and NaT values to None
+                              if pd.isna(value):
+                                  value = None
+                              # Convert datetime values to string
+                              elif isinstance(value, datetime.datetime):
+                                  value = str(value)
+
+                              # Convert numeric values to Decimal
+                              if isinstance(value, (int, float)):
+                                  value = Decimal(str(value))
+
+                              item[column] = value
+
+                          batch.put_item(Item=item)
+
+                  return {
+                      'statusCode': 200,
+                      'body': 'Data uploaded to DynamoDB successfully'
+                  }
+
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f"Error uploading data to DynamoDB: {e.response['Error']['Message']}"
+                  }
+
+
+  AdminWipeFileFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: AdminWipeFileFunction
+      Runtime: python3.9
+      MemorySize: 1000
+      Timeout: 900
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessLambdaRole.Arn
+      Layers:
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:7"
+      Environment:
+        Variables:
+          tableName: !Ref DynamoDBTableName
+          labName: !Ref PrimaryKeyID
+          sampleNumber: !Ref SortKeyID
+      Code:
+        ZipFile: |
+              import boto3
+              import os 
+              def lambda_handler(event, context):
+                  table_name = os.environ.get('tableName')
+                  labName= os.environ.get('labName')
+                  sampleNumber= os.environ.get('sampleNumber')
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(table_name)
+
+                  # Scan the DynamoDB table to retrieve all items
+                  response = table.scan()
+
+                  # Iterate through the items and delete them
+                  with table.batch_writer() as batch:
+                      for item in response['Items']:
+                          lab_name = item[labName]
+                          sample_number = item[sampleNumber]
+                          batch.delete_item(Key={labName: lab_name, sampleNumber: sample_number})
+
+                  return {
+                      'statusCode': 200,
+                      'body': 'All items deleted from DynamoDB table.'
+                  }
+
+  UserRequestForTheirOwnLabFileFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: UserRequestForTheirOwnLabFileFunction
+      Runtime: python3.9
+      MemorySize: 1000
+      Timeout: 900
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessLambdaRole.Arn
+      Layers:
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:7"
+      Environment:
+        Variables:
+          tableName: !Ref DynamoDBTableName
+          labName: !Ref PrimaryKeyID
+          sampleNumber: !Ref SortKeyID
+          bucketName: !Ref S3BucketName
+      Code:
+        ZipFile: |
+                import boto3
+                import pandas as pd
+                from io import BytesIO
+                from datetime import datetime 
+                import os 
+                def lambda_handler(event, context):
+                    # Create a DynamoDB resource
+                    dynamodb = boto3.resource('dynamodb')
+
+                    # Define the table name
+                    table_name = os.environ.get('tableName')
+                    labName = os.environ.get('labName')
+
+                    # Get the DynamoDB table
+                    table = dynamodb.Table(table_name)
+
+
+                    # Get the lab name from the event payload
+                    lab_name = event['queryStringParameters'].get('lab_name')
+
+                    # Get the start and end dates from the event payload
+                    start_date = event['queryStringParameters'].get('start_date')
+                    end_date = event['queryStringParameters'].get('end_date')
+                    # Add time components to the start date
+                    start_date += ' 00:00:00'  # Assuming time as 00:00:00
+                    
+                    # Add time components to the end date
+                    end_date += ' 23:59:59'  # Assuming time as 23:59:59
+
+                    # Define the attribute names for lab name and date
+                    lab_name_attribute_name = event['queryStringParameters']['attribute_name']
+                    date_attribute_name = event['queryStringParameters']['attribute_name']
+
+                    # Create expression attribute names for the attributes with spaces
+                    expression_attribute_names = {}
+
+                    # Create a filter expression based on the presence of lab name and/or date range
+                    filter_expression = ''
+                    expression_attribute_values = {}
+
+                    if lab_name:
+                        expression_attribute_names['#lab'] = lab_name_attribute_name
+                        filter_expression += '#lab = :lab_value'
+                        expression_attribute_values[':lab_value'] = lab_name
+                        name=lab_name
+                    if start_date and end_date:
+                        if filter_expression:
+                            filter_expression += ' OR '
+
+                        expression_attribute_names['#date'] = date_attribute_name
+                        filter_expression += '#date BETWEEN :start_date AND :end_date'
+                        expression_attribute_values[':start_date'] = start_date
+                        expression_attribute_values[':end_date'] = end_date
+                        name= start_date + '_' + end_date
+                    # Scan the table and filter the results based on lab name and/or date range
+                    response = table.scan(
+                        ExpressionAttributeNames=expression_attribute_names,
+                        FilterExpression=filter_expression,
+                        ExpressionAttributeValues=expression_attribute_values
+                    )
+
+                    # Get the items that match the lab name and/or date range
+                    items = response['Items']
+
+                    # Convert the items to a pandas DataFrame
+                    df = pd.DataFrame(items)
+
+                    # Create a BytesIO object to store the Excel file
+                    excel_buffer = BytesIO()
+
+                    # Write the DataFrame to the BytesIO object as an Excel file
+                    df.to_excel(excel_buffer, index=False)
+
+                    # Create an S3 client
+                    s3 = boto3.client('s3')
+
+                    # Define the S3 bucket name and file name
+                    bucket_name = os.environ.get('bucketName')
+                    file_name = 'UserReport/Lab-report-' + name + '.xlsx' 
+
+                    # Upload the Excel file to S3
+                    s3.put_object(
+                        Body=excel_buffer.getvalue(),
+                        Bucket=bucket_name,
+                        Key=file_name
+                    )
+
+                    # Generate a pre-signed URL for downloading the file
+                    presigned_url = s3.generate_presigned_url(
+                        'get_object',
+                        Params={'Bucket': bucket_name, 'Key': file_name},
+                        ExpiresIn=360  
+                    )
+
+                    # Return the pre-signed URL
+                    return {
+                        'statusCode': 200,
+                        'body': presigned_url
+                    }
+
+
+
+    
+
+                  
+  LabDynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: !Ref PrimaryKeyID
+          AttributeType: S
+        - AttributeName: !Ref SortKeyID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref PrimaryKeyID
+          KeyType: HASH
+        - AttributeName: !Ref SortKeyID
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  LabGetFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: GetPresignedUrlFunction
+      Runtime: python3.9
+      Handler: index.handler
+      MemorySize: 1000
+      Timeout: 900
+      Layers: 
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:7"
+      Environment:
+        Variables:
+          bucketName: !Ref S3BucketName
+          tableName: !Ref DynamoDBTableName
+      Role: !GetAtt LabGetLambdaRole.Arn
+      Code:
+        ZipFile: |
+              import json
+              import boto3
+              import pandas as pd
+              from openpyxl import Workbook
+              from io import BytesIO
+              import uuid
+              import os
+
+              def handler(event, context):
+                  # Retrieve data from DynamoDB
+                  tableName=os.environ.get('tableName')
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(tableName)
+                  response = table.scan()
+                  items = response['Items']
+
+                  # Extract primary key and convert JSON data to DataFrame
+                  df = pd.DataFrame(items)
+
+                  # Reorder columns
+                  column_order = ['Lab Name', 'State', 'Sample Number (ID)'] + list(df.columns.difference(['Lab Name', 'State', 'Sample Number (ID)']))
+                  df = df[column_order]
+
+                  # Convert DataFrame to Excel
+                  output = BytesIO()
+                  df.to_excel(output, sheet_name='LabSheet1', index=False)
+                  output.seek(0)
+
+                  # Upload Excel file to S3 bucket
+                  s3 = boto3.client('s3')
+                  bucket_name = os.environ.get('bucketName')
+                  # Generate a random UUID
+                  random_uuid = uuid.uuid4()
+                  excel_filename = 'download/Lab-report-' + str(random_uuid) + '.xlsx'
+                  s3.upload_fileobj(output, bucket_name, excel_filename)
+
+                  # Generate presigned URL for downloading the object
+                  presigned_url = s3.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': bucket_name, 'Key': excel_filename},
+                      ExpiresIn=300 
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': presigned_url
+                  }
+
+  LabDownloadAminFileFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: LabDownloadAminFileFunction
+      Runtime: python3.9
+      Handler: index.handler
+      MemorySize: 1000
+      Timeout: 900
+      Layers: 
+        - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python39:7"
+      Environment:
+        Variables:
+          bucketName: !Ref S3BucketName
+          tableName: !Ref DynamoDBTableName
+      Role: !GetAtt LabGetLambdaRole.Arn
+      Code:
+        ZipFile: |
+              import json
+              import boto3
+              import pandas as pd
+              from openpyxl import Workbook
+              from io import BytesIO
+              import uuid
+              import os
+
+              def handler(event, context):
+                  # Upload Excel file to S3 bucket
+                  s3 = boto3.client('s3')
+                  bucket_name = os.environ.get('bucketName')
+                  excel_filename = 'admin/Lab-report-format.xlsx'
+                  # Generate presigned URL for downloading the object
+                  presigned_url = s3.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': bucket_name, 'Key': excel_filename},
+                      ExpiresIn=300 
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': presigned_url
+                  }
+
+
+  LabGetLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: Lab-GetLambdaRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: Lab-download-LambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject' 
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:Scan'
+    
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LabDynamoDBTable}
+
+  LabUploadAdminfileFormatlambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Lab-Upload-Admin-File-Format-lambda-function
+      Runtime: python3.9
+      Handler: index.handler
+      MemorySize: 1000
+      Timeout: 900
+      Role: !GetAtt LabUploadfilelambdaRole.Arn
+      Environment:
+        Variables:
+          bucketName: !Ref S3BucketName
+      Code:
+        ZipFile: |
+                import json
+                import boto3
+                import os 
+                def handler(event, context):
+                    s3 = boto3.client('s3')
+                    bucket_name = os.environ.get('bucketName')    
+                    # Convert the UUID to a string and append the desired file name
+                    key = 'admin/Lab-report-format.xlsx'
+                    # Generate presigned post URL
+                    presigned_post = s3.generate_presigned_post(
+                        Bucket=bucket_name,
+                        Key=key,
+                        ExpiresIn=360
+                    )
+                
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps(presigned_post)
+                    }
+
+
+  LabUploadfilelambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: Lab-Upload-lambda-function
+      Runtime: python3.9
+      Handler: index.handler
+      MemorySize: 1000
+      Timeout: 900
+      Role: !GetAtt LabUploadfilelambdaRole.Arn
+      Environment:
+        Variables:
+          bucketName: !Ref S3BucketName
+      Code:
+        ZipFile: |
+                import json
+                import boto3
+                import uuid
+                import os 
+                def handler(event, context):
+                    s3 = boto3.client('s3')
+                    bucket_name = os.environ.get('bucketName')
+                    # Generate a random UUID
+                    random_uuid = uuid.uuid4()
+                    
+                    # Convert the UUID to a string and append the desired file name
+                    key = 'upload/Lab-report-' + str(random_uuid) + '.xlsx'
+                
+                
+                    # Generate presigned post URL
+                    presigned_post = s3.generate_presigned_post(
+                        Bucket=bucket_name,
+                        Key=key,
+                        ExpiresIn=360
+                    )
+                
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps(presigned_post)
+                    }
+
+      
+
+  LabUploadfilelambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: Lab-uploadfile-lambda
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: Lab-uploadfile-lambda-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 's3:GeneratePresignedPost'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'    
+  LabUploadRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: Lab-upload-rest-api
+  LabUploadApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: user-presigned-url
+
+  LabUploadAdminApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: admin-presigned-url  
+
+  LabUploadAdminApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref LabUploadAdminApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LabUploadAdminfileFormatlambdaFunction.Arn}/invocations
+        Credentials: !GetAtt MyApiGatewayRole.Arn  
+      MethodResponses:
+        - StatusCode: '200' 
+
+  LabUploadApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref LabUploadApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LabUploadfilelambdaFunction.Arn}/invocations
+          
+        Credentials: !GetAtt MyApiGatewayRole.Arn  
+      MethodResponses:
+        - StatusCode: '200'
+
+  LabDownloadApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: admin-download-resource
+
+  LabDownloadApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref LabDownloadApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LabGetFunction.Arn}/invocations
+          
+        Credentials: !GetAtt MyApiGatewayRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+
+  LabDownloadUserAdminApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: user-download-admin-resource
+
+  LabDownloadUserAdminApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref LabDownloadUserAdminApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LabDownloadAminFileFunction.Arn}/invocations
+          
+        Credentials: !GetAtt MyApiGatewayRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+
+  AdminWipeDataApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: admin-wipe-db-resource
+
+  AdminWipeDataApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref AdminWipeDataApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminWipeFileFunction.Arn}/invocations
+          
+        Credentials: !GetAtt MyApiGatewayRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+
+  UserDownloadOwnDataApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: User-download-own-db-resource
+
+  UserDownloadOwnDataApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref UserDownloadOwnDataApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.lab_name: true
+        method.request.querystring.attribute_name: true
+
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserRequestForTheirOwnLabFileFunction.Arn}/invocations
+          
+        Credentials: !GetAtt MyApiGatewayRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+
+  AdminRequstDataBaseOnDateRangeApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ParentId: !GetAtt LabUploadRestApi.RootResourceId
+      PathPart: Admin-download-data-base-on-date-range-db-resource
+
+  AdminDownloadDataBaseOnDateRangeApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      ResourceId: !Ref AdminRequstDataBaseOnDateRangeApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.start_date: true
+        method.request.querystring.end_date: true
+        method.request.querystring.attribute_name: true
+
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub >-
+          arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserRequestForTheirOwnLabFileFunction.Arn}/invocations
+          
+        Credentials: !GetAtt MyApiGatewayRole.Arn
+      MethodResponses:
+        - StatusCode: '200'
+
+  LabUploadDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: [LabUploadApiMethod,LabUploadAdminApiMethod,LabDownloadApiMethod,LabDownloadUserAdminApiMethod,AdminWipeDataApiMethod,UserDownloadOwnDataApiMethod,AdminDownloadDataBaseOnDateRangeApiMethod]
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+  LabUploadStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref LabUploadRestApi
+      StageName: dev
+      DeploymentId: !Ref LabUploadDeployment      
